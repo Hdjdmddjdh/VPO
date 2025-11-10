@@ -1,0 +1,993 @@
+using BepInEx.Configuration;
+using UnityEngine;
+using System.Collections;
+
+namespace VPO.Modules
+{
+    public class GCManager : MonoBehaviour
+    {
+        private static ConfigEntry<bool> _enable;
+        private static ConfigEntry<float> _interval;
+
+        public static void Init(BepInEx.Configuration.ConfigFile cfg, MonoBehaviour runner)
+        {
+            _enable   = cfg.Bind("GC", "Enable", true, "Включить сглаживание GC.");
+            _interval = cfg.Bind("GC", "IntervalSec", 20f, "Интервал мягких сборок мусора (сек).");
+            runner.StartCoroutine(Co());
+        }
+
+        private static IEnumerator Co()
+        {
+            while (true)
+            {
+                if (_enable.Value)
+                {
+                    System.GC.Collect(System.GC.MaxGeneration, System.GCCollectionMode.Optimized, false, false);
+                }
+                yield return new WaitForSecondsRealtime(Mathf.Max(5f, _interval.Value));
+            }
+        }
+    }
+}
+
+using System.Collections;
+using BepInEx;
+using BepInEx.Configuration;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+namespace VPO
+{
+    [BepInPlugin("com.example.vpo.gpu", "VPO GPU Boost", "0.2.1")]
+    public class GPUBoostPlugin : BaseUnityPlugin
+    {
+        // === Конфиг (совместим с твоими cfg) ===
+        private ConfigEntry<bool> _enableInstancing;
+        private ConfigEntry<bool> _onlyMeshRenderers;
+        private ConfigEntry<int>  _batchSize;
+        private ConfigEntry<bool> _forceAniso;
+        private ConfigEntry<int>  _globalMips;
+        private ConfigEntry<bool> _secondPass;
+        private ConfigEntry<int>  _secondDelay;
+        private ConfigEntry<int>  _firstDelay;
+        private ConfigEntry<bool> _uploadTuner;
+
+        private bool _didMenuPass;
+        private bool _didWorldPass1;
+        private bool _didWorldPass2;
+
+        private void Awake()
+        {
+            // Разделы названы так, как у тебя в cfg
+            _enableInstancing    = Config.Bind("GPU Instancing", "EnableMaterialInstancing", true, "Включить instancing (материалы) порциями.");
+            _onlyMeshRenderers   = Config.Bind("GPU Instancing", "OnlyMeshRenderers", false, "true = только MeshRenderer; false = включая SkinnedMeshRenderer.");
+            _batchSize           = Config.Bind("GPU Instancing", "MaterialsPerFrame", 64, "Сколько рендереров обрабатывать за кадр.");
+            _forceAniso          = Config.Bind("GPU Quality",     "ForceAnisotropicFiltering", true, "Принудительно включить AF.");
+            _globalMips          = Config.Bind("GPU Quality",     "GlobalTextureMipmapLimit", 0, "0 = макс. качество; 1..3 — грубее мипы.");
+            _secondPass          = Config.Bind("GPU Streaming",   "EnableSecondPass", true, "Сделать повторный мягкий проход.");
+            _secondDelay         = Config.Bind("GPU Streaming",   "StreamingSecondPassDelaySec", 10, "Задержка перед повторным проходом, сек.");
+            _firstDelay          = Config.Bind("GPU Streaming",   "ForceLoadDelaySec", 2, "Задержка перед первым прогревом, сек.");
+            _uploadTuner         = Config.Bind("GPU Streaming",   "EnableUploadTuner", true, "Мягкие UploadMeshData-подсказки.");
+
+            ApplyGraphicsOnce();
+
+            // Меню: безопасный мини‑проход (может обработать 0 — это ок)
+            StartCoroutine(InstancingPassDelayed(_firstDelay.Value, context:"menu", markFlag: ()=> _didMenuPass = true));
+
+            // Реагируем на смену сцен
+            SceneManager.activeSceneChanged += OnSceneChanged;
+        }
+
+        private void OnDestroy()
+        {
+            SceneManager.activeSceneChanged -= OnSceneChanged;
+        }
+
+        private void OnSceneChanged(Scene from, Scene to)
+        {
+            // Первый проход через пару секунд после входа в мир
+            if (!_didWorldPass1)
+                StartCoroutine(InstancingPassDelayed(3, context:"world-1", markFlag: ()=> _didWorldPass1 = true));
+
+            // Второй мягкий через 12–15 сек после входа (или что задано в конфиге)
+            if (_secondPass.Value && !_didWorldPass2)
+                StartCoroutine(InstancingPassDelayed(Mathf.Max(8, _secondDelay.Value), context:"world-2", markFlag: ()=> _didWorldPass2 = true));
+        }
+
+        private void ApplyGraphicsOnce()
+        {
+            QualitySettings.globalTextureMipmapLimit = Mathf.Max(0, _globalMips.Value);
+            QualitySettings.anisotropicFiltering = _forceAniso.Value
+                ? AnisotropicFiltering.ForceEnable
+                : AnisotropicFiltering.Enable;
+        }
+
+        private IEnumerator InstancingPassDelayed(int delaySec, string context, System.Action markFlag)
+        {
+            if (!_enableInstancing.Value) yield break;
+            if (delaySec > 0) yield return new WaitForSeconds(delaySec);
+
+            int processed = 0;
+            if (_onlyMeshRenderers.Value)
+            {
+                var arr = Object.FindObjectsByType<MeshRenderer>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+                processed += EnableInstancingFor(arr);
+            }
+            else
+            {
+                var a = Object.FindObjectsByType<MeshRenderer>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+                var b = Object.FindObjectsByType<SkinnedMeshRenderer>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+                processed += EnableInstancingFor(a);
+                processed += EnableInstancingFor(b);
+            }
+
+            Logger.LogInfo($"[GPU] Instancing включён ({context}), обработано материалов/рендереров: {processed}.");
+            markFlag?.Invoke();
+            yield break;
+        }
+
+        private int EnableInstancingFor(Renderer[] renderers)
+        {
+            int processed = 0;
+            int batch = Mathf.Max(8, _batchSize.Value);
+            int local = 0;
+
+            for (int i = 0; i < renderers.Length; i++)
+            {
+                var r = renderers[i];
+                if (!r) continue;
+                var mats = r.sharedMaterials;
+                if (mats == null) continue;
+
+                for (int m = 0; m < mats.Length; m++)
+                {
+                    var mat = mats[m];
+                    if (!mat) continue;
+                    if (!mat.enableInstancing) mat.enableInstancing = true;
+                    processed++;
+                }
+
+                if (_uploadTuner.Value)
+                {
+                    if (r is MeshRenderer mr)
+                    {
+                        var mf = mr.GetComponent<MeshFilter>();
+                        if (mf && mf.sharedMesh) mf.sharedMesh.UploadMeshData(false);
+                    }
+                    else if (r is SkinnedMeshRenderer smr)
+                    {
+                        if (smr.sharedMesh) smr.sharedMesh.UploadMeshData(false);
+                    }
+                }
+
+                local++;
+                if ((local % batch) == 0) { local = 0; }
+            }
+            return processed;
+        }
+    }
+}
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace VPO.Modules
+{
+    /// <summary>
+    /// Безопасный батчинг статических мешей. Не трогаем Piece/дым/воду.
+    /// Использует StaticBatchingUtility.Combine для стабильности.
+    /// </summary>
+    public static class MeshCombiner
+    {
+        // Грубые фильтры компонентов, которые НЕ нужно комбинировать
+        private static readonly string[] BlockedTypes =
+        {
+            "Piece", "WearNTear", "Smoke", "ZNetView", "WaterVolume", "Fermenter", "BeeHive"
+        };
+
+        /// <summary>
+        /// Комбинирует детей у указанного корня, соблюдая лимиты.
+        /// </summary>
+        public static int CombineUnder(Transform root, int maxTrisPerBatch = 40000)
+        {
+            if (root == null) return 0;
+
+            var toCombine = new List<GameObject>();
+            var filters = root.GetComponentsInChildren<MeshFilter>(true);
+            foreach (var f in filters)
+            {
+                if (f == null || f.sharedMesh == null) continue;
+                var go = f.gameObject;
+                if (!go.activeInHierarchy) continue;
+                if (HasBlocked(go)) continue;
+                if (f.sharedMesh.triangles.Length / 3 > maxTrisPerBatch) continue;
+
+                toCombine.Add(go);
+            }
+
+            if (toCombine.Count == 0) return 0;
+
+            try
+            {
+                StaticBatchingUtility.Combine(toCombine.ToArray(), root.gameObject);
+            }
+            catch { /* если что-то пошло не так — просто пропускаем */ }
+
+            return toCombine.Count;
+        }
+
+        private static bool HasBlocked(GameObject go)
+        {
+            foreach (var t in BlockedTypes)
+            {
+                var comp = go.GetComponent(t);
+                if (comp != null) return true;
+            }
+            return false;
+        }
+    }
+}
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace VPO
+{
+    public static class PoolingManager
+    {
+        private static readonly Dictionary<string, Queue<GameObject>> _pools = new();
+        private static Transform _root;
+
+        private static Transform Root
+        {
+            get
+            {
+                if (_root == null)
+                {
+                    var go = new GameObject("[VPO_Pool]");
+                    Object.DontDestroyOnLoad(go);
+                    _root = go.transform;
+                }
+                return _root;
+            }
+        }
+
+        public static GameObject GetFromPool(GameObject prefab)
+        {
+            if (!prefab) return null;
+            var key = prefab.name;
+
+            if (_pools.TryGetValue(key, out var q) && q.Count > 0)
+            {
+                var obj = q.Dequeue();
+                if (obj) obj.SetActive(true);
+                return obj;
+            }
+
+            var inst = Object.Instantiate(prefab);
+            inst.name = key;
+            inst.SetActive(true);
+            return inst;
+        }
+
+        public static void ReturnToPool(GameObject obj)
+        {
+            if (!obj) return;
+            var key = obj.name;
+
+            if (!_pools.TryGetValue(key, out var q))
+            {
+                q = new Queue<GameObject>();
+                _pools[key] = q;
+            }
+
+            obj.SetActive(false);
+            obj.transform.SetParent(Root, false);
+            q.Enqueue(obj);
+        }
+    }
+}
+using System.Collections;
+using UnityEngine;
+
+namespace VPO.Modules
+{
+    public class ThreadedWorldLoader : MonoBehaviour
+    {
+        public static void StartWarmup(MonoBehaviour runner, float delaySec = 2f)
+        {
+            runner.StartCoroutine(DoWarmup(delaySec));
+        }
+
+        private static IEnumerator DoWarmup(float delaySec)
+        {
+            if (delaySec > 0f) yield return new WaitForSecondsRealtime(delaySec);
+
+            float end = Time.unscaledTime + 3f;
+            while (Time.unscaledTime < end)
+            {
+                Resources.UnloadUnusedAssets();
+                yield return null;
+            }
+        }
+    }
+}
+
+using System;
+using HarmonyLib;
+using UnityEngine;
+
+namespace VPO.Modules
+{
+    /// <summary>
+    /// Распределяет апдейты ИИ/физики по кадрам.
+    /// Простая логика: выполняем только раз в N кадров (N динамический).
+    /// </summary>
+    public static class UpdateThrottler
+    {
+        private static int _aiInterval = 2;
+        private static int _physicsInterval = 2;
+
+        public static void Configure(int aiInterval, int physicsInterval)
+        {
+            _aiInterval = Mathf.Max(1, aiInterval);
+            _physicsInterval = Mathf.Max(1, physicsInterval);
+        }
+
+        private static bool ShouldRun(int interval)
+        {
+            if (interval <= 1) return true;
+            return (Time.frameCount % interval) == 0;
+        }
+
+        // ---- Патч BaseAI.UpdateAI ----
+        [HarmonyPatch]
+        internal static class Patch_BaseAI_UpdateAI
+        {
+            static System.Reflection.MethodBase TargetMethod()
+            {
+                var t = AccessTools.TypeByName("BaseAI");
+                return t != null ? AccessTools.Method(t, "UpdateAI") : null;
+            }
+
+            static bool Prefix()
+            {
+                return ShouldRun(_aiInterval);
+            }
+        }
+
+        // ---- Патч BaseAI.FixedUpdate ----
+        [HarmonyPatch]
+        internal static class Patch_BaseAI_FixedUpdate
+        {
+            static System.Reflection.MethodBase TargetMethod()
+            {
+                var t = AccessTools.TypeByName("BaseAI");
+                return t != null ? AccessTools.Method(t, "FixedUpdate") : null;
+            }
+
+            static bool Prefix()
+            {
+                return ShouldRun(_physicsInterval);
+            }
+        }
+    }
+}
+
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.14.36327.8
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "VPO", "VPO\VPO.csproj", "{4D7DA576-3D93-4F6C-B1D4-6782C16388E7}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "н", "н", "{36D591C7-65C7-A0D1-1CBC-10CDE441BDC8}"
+	ProjectSection(SolutionItems) = preProject
+		.gitattributes = .gitattributes
+		.gitignore = .gitignore
+		CoreMod.cs = CoreMod.cs
+		DynamicLODManager.cs = DynamicLODManager.cs
+		EffectOptimizer.cs = EffectOptimizer.cs
+		GCManager.cs = GCManager.cs
+		GPUBoostPlugin.cs = GPUBoostPlugin.cs
+		MeshCombiner.cs = MeshCombiner.cs
+		PoolingManager.cs = PoolingManager.cs
+		ThreadedWorldLoader.cs = ThreadedWorldLoader.cs
+		UpdateThrottler.cs = UpdateThrottler.cs
+		ZonePrefetch.cs = ZonePrefetch.cs
+	EndProjectSection
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{4D7DA576-3D93-4F6C-B1D4-6782C16388E7}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{4D7DA576-3D93-4F6C-B1D4-6782C16388E7}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{4D7DA576-3D93-4F6C-B1D4-6782C16388E7}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{4D7DA576-3D93-4F6C-B1D4-6782C16388E7}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {6DD24BE5-4CBD-422B-A6E9-F633571010FF}
+	EndGlobalSection
+EndGlobal
+
+using BepInEx.Configuration;
+using UnityEngine;
+
+namespace VPO.Modules
+{
+    public class ZonePrefetch : MonoBehaviour
+    {
+        private static ConfigEntry<bool> _enable;
+        private static ConfigEntry<float> _interval;
+        private static float _next;
+
+        public static void Init(BepInEx.Configuration.ConfigFile cfg, float intervalSec = 2.5f)
+        {
+            _enable   = cfg.Bind("ZonePrefetch", "Enable", true, "Включить мягкое предзапрос зон вокруг игрока.");
+            _interval = cfg.Bind("ZonePrefetch", "IntervalSec", intervalSec, "Интервал запросов (сек).");
+        }
+
+        void Update()
+        {
+            if (!_enable.Value) return;
+            if (Time.unscaledTime < _next) return;
+            _next = Time.unscaledTime + Mathf.Max(0.5f, _interval.Value);
+
+            Resources.UnloadUnusedAssets();
+        }
+    }
+}
+
+###############################################################################
+# Set default behavior to automatically normalize line endings.
+###############################################################################
+* text=auto
+
+###############################################################################
+# Set default behavior for command prompt diff.
+#
+# This is need for earlier builds of msysgit that does not have it on by
+# default for csharp files.
+# Note: This is only used by command line
+###############################################################################
+#*.cs     diff=csharp
+
+###############################################################################
+# Set the merge driver for project and solution files
+#
+# Merging from the command prompt will add diff markers to the files if there
+# are conflicts (Merging from VS is not affected by the settings below, in VS
+# the diff markers are never inserted). Diff markers may cause the following 
+# file extensions to fail to load in VS. An alternative would be to treat
+# these files as binary and thus will always conflict and require user
+# intervention with every merge. To do so, just uncomment the entries below
+###############################################################################
+#*.sln       merge=binary
+#*.csproj    merge=binary
+#*.vbproj    merge=binary
+#*.vcxproj   merge=binary
+#*.vcproj    merge=binary
+#*.dbproj    merge=binary
+#*.fsproj    merge=binary
+#*.lsproj    merge=binary
+#*.wixproj   merge=binary
+#*.modelproj merge=binary
+#*.sqlproj   merge=binary
+#*.wwaproj   merge=binary
+
+###############################################################################
+# behavior for image files
+#
+# image files are treated as binary by default.
+###############################################################################
+#*.jpg   binary
+#*.png   binary
+#*.gif   binary
+
+###############################################################################
+# diff behavior for common document formats
+# 
+# Convert binary document formats to text before diffing them. This feature
+# is only available from the command line. Turn it on by uncommenting the 
+# entries below.
+###############################################################################
+#*.doc   diff=astextplain
+#*.DOC   diff=astextplain
+#*.docx  diff=astextplain
+#*.DOCX  diff=astextplain
+#*.dot   diff=astextplain
+#*.DOT   diff=astextplain
+#*.pdf   diff=astextplain
+#*.PDF   diff=astextplain
+#*.rtf   diff=astextplain
+#*.RTF   diff=astextplain
+
+## Ignore Visual Studio temporary files, build results, and
+## files generated by popular Visual Studio add-ons.
+##
+## Get latest from https://github.com/github/gitignore/blob/master/VisualStudio.gitignore
+
+# User-specific files
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# User-specific files (MonoDevelop/Xamarin Studio)
+*.userprefs
+
+# Mono auto generated files
+mono_crash.*
+
+# Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+[Ll]og/
+[Ll]ogs/
+
+# Visual Studio 2015/2017 cache/options directory
+.vs/
+# Uncomment if you have tasks that create the project's static files in wwwroot
+#wwwroot/
+
+# Visual Studio 2017 auto generated files
+Generated\ Files/
+
+# MSTest test Results
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+
+# NUnit
+*.VisualState.xml
+TestResult.xml
+nunit-*.xml
+
+# Build Results of an ATL Project
+[Dd]ebugPS/
+[Rr]eleasePS/
+dlldata.c
+
+# Benchmark Results
+BenchmarkDotNet.Artifacts/
+
+# .NET Core
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# ASP.NET Scaffolding
+ScaffoldingReadMe.txt
+
+# StyleCop
+StyleCopReport.xml
+
+# Files built by Visual Studio
+*_i.c
+*_p.c
+*_h.h
+*.ilk
+*.meta
+*.obj
+*.iobj
+*.pch
+*.pdb
+*.ipdb
+*.pgc
+*.pgd
+*.rsp
+*.sbr
+*.tlb
+*.tli
+*.tlh
+*.tmp
+*.tmp_proj
+*_wpftmp.csproj
+*.log
+*.vspscc
+*.vssscc
+.builds
+*.pidb
+*.svclog
+*.scc
+
+# Chutzpah Test files
+_Chutzpah*
+
+# Visual C++ cache files
+ipch/
+*.aps
+*.ncb
+*.opendb
+*.opensdf
+*.sdf
+*.cachefile
+*.VC.db
+*.VC.VC.opendb
+
+# Visual Studio profiler
+*.psess
+*.vsp
+*.vspx
+*.sap
+
+# Visual Studio Trace Files
+*.e2e
+
+# TFS 2012 Local Workspace
+$tf/
+
+# Guidance Automation Toolkit
+*.gpState
+
+# ReSharper is a .NET coding add-in
+_ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+
+# TeamCity is a build add-in
+_TeamCity*
+
+# DotCover is a Code Coverage Tool
+*.dotCover
+
+# AxoCover is a Code Coverage Tool
+.axoCover/*
+!.axoCover/settings.json
+
+# Coverlet is a free, cross platform Code Coverage Tool
+coverage*.json
+coverage*.xml
+coverage*.info
+
+# Visual Studio code coverage results
+*.coverage
+*.coveragexml
+
+# NCrunch
+_NCrunch_*
+.*crunch*.local.xml
+nCrunchTemp_*
+
+# MightyMoose
+*.mm.*
+AutoTest.Net/
+
+# Web workbench (sass)
+.sass-cache/
+
+# Installshield output folder
+[Ee]xpress/
+
+# DocProject is a documentation generator add-in
+DocProject/buildhelp/
+DocProject/Help/*.HxT
+DocProject/Help/*.HxC
+DocProject/Help/*.hhc
+DocProject/Help/*.hhk
+DocProject/Help/*.hhp
+DocProject/Help/Html2
+DocProject/Help/html
+
+# Click-Once directory
+publish/
+
+# Publish Web Output
+*.[Pp]ublish.xml
+*.azurePubxml
+# Note: Comment the next line if you want to checkin your web deploy settings,
+# but database connection strings (with potential passwords) will be unencrypted
+*.pubxml
+*.publishproj
+
+# Microsoft Azure Web App publish settings. Comment the next line if you want to
+# checkin your Azure Web App publish settings, but sensitive information contained
+# in these scripts will be unencrypted
+PublishScripts/
+
+# NuGet Packages
+*.nupkg
+# NuGet Symbol Packages
+*.snupkg
+# The packages folder can be ignored because of Package Restore
+**/[Pp]ackages/*
+# except build/, which is used as an MSBuild target.
+!**/[Pp]ackages/build/
+# Uncomment if necessary however generally it will be regenerated when needed
+#!**/[Pp]ackages/repositories.config
+# NuGet v3's project.json files produces more ignorable files
+*.nuget.props
+*.nuget.targets
+
+# Microsoft Azure Build Output
+csx/
+*.build.csdef
+
+# Microsoft Azure Emulator
+ecf/
+rcf/
+
+# Windows Store app package directories and files
+AppPackages/
+BundleArtifacts/
+Package.StoreAssociation.xml
+_pkginfo.txt
+*.appx
+*.appxbundle
+*.appxupload
+
+# Visual Studio cache files
+# files ending in .cache can be ignored
+*.[Cc]ache
+# but keep track of directories ending in .cache
+!?*.[Cc]ache/
+
+# Others
+ClientBin/
+~$*
+*~
+*.dbmdl
+*.dbproj.schemaview
+*.jfm
+*.pfx
+*.publishsettings
+orleans.codegen.cs
+
+# Including strong name files can present a security risk
+# (https://github.com/github/gitignore/pull/2483#issue-259490424)
+#*.snk
+
+# Since there are multiple workflows, uncomment next line to ignore bower_components
+# (https://github.com/github/gitignore/pull/1529#issuecomment-104372622)
+#bower_components/
+
+# RIA/Silverlight projects
+Generated_Code/
+
+# Backup & report files from converting an old project file
+# to a newer Visual Studio version. Backup files are not needed,
+# because we have git ;-)
+_UpgradeReport_Files/
+Backup*/
+UpgradeLog*.XML
+UpgradeLog*.htm
+ServiceFabricBackup/
+*.rptproj.bak
+
+# SQL Server files
+*.mdf
+*.ldf
+*.ndf
+
+# Business Intelligence projects
+*.rdl.data
+*.bim.layout
+*.bim_*.settings
+*.rptproj.rsuser
+*- [Bb]ackup.rdl
+*- [Bb]ackup ([0-9]).rdl
+*- [Bb]ackup ([0-9][0-9]).rdl
+
+# Microsoft Fakes
+FakesAssemblies/
+
+# GhostDoc plugin setting file
+*.GhostDoc.xml
+
+# Node.js Tools for Visual Studio
+.ntvs_analysis.dat
+node_modules/
+
+# Visual Studio 6 build log
+*.plg
+
+# Visual Studio 6 workspace options file
+*.opt
+
+# Visual Studio 6 auto-generated workspace file (contains which files were open etc.)
+*.vbw
+
+# Visual Studio LightSwitch build output
+**/*.HTMLClient/GeneratedArtifacts
+**/*.DesktopClient/GeneratedArtifacts
+**/*.DesktopClient/ModelManifest.xml
+**/*.Server/GeneratedArtifacts
+**/*.Server/ModelManifest.xml
+_Pvt_Extensions
+
+# Paket dependency manager
+.paket/paket.exe
+paket-files/
+
+# FAKE - F# Make
+.fake/
+
+# CodeRush personal settings
+.cr/personal
+
+# Python Tools for Visual Studio (PTVS)
+__pycache__/
+*.pyc
+
+# Cake - Uncomment if you are using it
+# tools/**
+# !tools/packages.config
+
+# Tabs Studio
+*.tss
+
+# Telerik's JustMock configuration file
+*.jmconfig
+
+# BizTalk build output
+*.btp.cs
+*.btm.cs
+*.odx.cs
+*.xsd.cs
+
+# OpenCover UI analysis results
+OpenCover/
+
+# Azure Stream Analytics local run output
+ASALocalRun/
+
+# MSBuild Binary and Structured Log
+*.binlog
+
+# NVidia Nsight GPU debugger configuration file
+*.nvuser
+
+# MFractors (Xamarin productivity tool) working folder
+.mfractor/
+
+# Local History for Visual Studio
+.localhistory/
+
+# BeatPulse healthcheck temp database
+healthchecksdb
+
+# Backup folder for Package Reference Convert tool in Visual Studio 2017
+MigrationBackup/
+
+# Ionide (cross platform F# VS Code tools) working folder
+.ionide/
+
+# Fody - auto-generated XML schema
+FodyWeavers.xsd
+using BepInEx;
+using BepInEx.Logging;
+using HarmonyLib;
+using System;
+using System.Reflection;
+
+namespace VPO
+{
+    [BepInPlugin("com.example.vpo.core", "VPO Core", "0.2.3")]
+    public class CoreMod : BaseUnityPlugin
+    {
+        internal static ManualLogSource Log;
+        internal static Harmony H;
+        internal static int UpdateStep = 2; // 1 = без троттлинга
+
+        private void Awake()
+        {
+            Log = Logger;
+            H = new Harmony("com.example.vpo.core");
+
+            UpdateStep = Config.Bind("Core", "UpdateThrottlerStep", 2,
+                "Шаг троттлинга логики (1..4). 1 = без троттлинга").Value;
+
+            try
+            {
+                H.PatchAll(typeof(CoreMod).Assembly);
+                Logger.LogInfo($"[VPO Core] Патчи применены. UpdateStep={UpdateStep}");
+            }
+            catch (Exception e)
+            {
+                Logger.LogError($"[VPO Core] Ошибка при PatchAll: {e.GetType().Name}: {e.Message}");
+            }
+        }
+    }
+
+    internal static class UpdateThrottlerUtil
+    {
+        private static int s_counter;
+        public static bool ShouldRun(int step)
+        {
+            if (step <= 1) return true;
+            s_counter++;
+            if (s_counter >= step) { s_counter = 0; return true; }
+            return false;
+        }
+    }
+}
+using BepInEx.Configuration;
+using UnityEngine;
+
+namespace VPO.Modules
+{
+    public class DynamicLODManager : MonoBehaviour
+    {
+        private static ConfigEntry<bool> _enable;
+        private static ConfigEntry<float> _baseDistance;
+        private static ConfigEntry<float> _scaleWithFPS;
+        private static float _targetFPS = 60f;
+
+        public static void Init(BepInEx.Configuration.ConfigFile cfg)
+        {
+            _enable       = cfg.Bind("DynamicLOD", "Enable", true, "Включить динамическую регулировку дистанций/LOD.");
+            _baseDistance = cfg.Bind("DynamicLOD", "BaseDistance", 80f, "Базовая дистанция отрисовки декора/мелочей.");
+            _scaleWithFPS = cfg.Bind("DynamicLOD", "ScaleWithFPS", 1.0f, "Насколько агрессивно масштабировать под FPS (0..2).");
+        }
+
+        void Update()
+        {
+            if (!_enable.Value) return;
+
+            float fps = 1f / Mathf.Max(0.0001f, Time.unscaledDeltaTime);
+            float factor = Mathf.Clamp01(fps / _targetFPS) * _scaleWithFPS.Value + (1f - _scaleWithFPS.Value);
+            float dist = Mathf.Clamp(_baseDistance.Value * factor, 30f, 200f);
+
+            QualitySettings.lodBias = Mathf.Clamp(dist / 80f, 0.5f, 2.5f);
+        }
+    }
+}
+
+using BepInEx.Configuration;
+using UnityEngine;
+
+namespace VPO.Modules
+{
+    public class EffectOptimizer : MonoBehaviour
+    {
+        private static ConfigEntry<bool> _enable;
+        private static ConfigEntry<float> _farDistance;
+        private static ConfigEntry<float> _nearDistance;
+
+        public static void Init(BepInEx.Configuration.ConfigFile cfg)
+        {
+            _enable       = cfg.Bind("Effects", "Enable", true, "Снижать нагрузку от частиц на дальних дистанциях.");
+            _farDistance  = cfg.Bind("Effects", "FarDistance", 60f, "Дистанция, дальше которой эффекты упрощаются.");
+            _nearDistance = cfg.Bind("Effects", "NearDistance", 15f, "Дистанция, ближе которой эффекты возвращаются к норме.");
+        }
+
+        void Update()
+        {
+            if (!_enable.Value) return;
+
+            var cam = Camera.main;
+            if (cam == null) return;
+
+            var particles = UnityEngine.Object.FindObjectsByType<ParticleSystem>(FindObjectsSortMode.None);
+            foreach (var ps in particles)
+            {
+                if (ps == null) continue;
+                float dist = Vector3.Distance(cam.transform.position, ps.transform.position);
+                var main = ps.main;
+                if (dist > _farDistance.Value)
+                {
+                    main.maxParticles = Mathf.Min(main.maxParticles, 64);
+                }
+                else if (dist < _nearDistance.Value)
+                {
+                    main.maxParticles = Mathf.Max(main.maxParticles, 256);
+                }
+            }
+        }
+    }
+}
