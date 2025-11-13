@@ -1,3 +1,4 @@
+// GPUBoostPlugin.cs (fixed: без _didMenuPass и без предупреждений)
 using System.Collections;
 using BepInEx;
 using BepInEx.Configuration;
@@ -6,10 +7,10 @@ using UnityEngine.SceneManagement;
 
 namespace VPO
 {
-    [BepInPlugin("com.example.vpo.gpu", "VPO GPU Boost", "0.2.1")]
+    [BepInPlugin("com.example.vpo.gpu", "VPO GPU Boost", "0.2.2")]
     public class GPUBoostPlugin : BaseUnityPlugin
     {
-        // === Конфиг (совместим с твоими cfg) ===
+        // === Конфиг ===
         private ConfigEntry<bool> _enableInstancing;
         private ConfigEntry<bool> _onlyMeshRenderers;
         private ConfigEntry<int>  _batchSize;
@@ -20,27 +21,26 @@ namespace VPO
         private ConfigEntry<int>  _firstDelay;
         private ConfigEntry<bool> _uploadTuner;
 
-        private bool _didMenuPass;
+        // флаги, которые реально используются
         private bool _didWorldPass1;
         private bool _didWorldPass2;
 
         private void Awake()
         {
-            // Разделы названы так, как у тебя в cfg
             _enableInstancing    = Config.Bind("GPU Instancing", "EnableMaterialInstancing", true, "Включить instancing (материалы) порциями.");
             _onlyMeshRenderers   = Config.Bind("GPU Instancing", "OnlyMeshRenderers", false, "true = только MeshRenderer; false = включая SkinnedMeshRenderer.");
             _batchSize           = Config.Bind("GPU Instancing", "MaterialsPerFrame", 64, "Сколько рендереров обрабатывать за кадр.");
             _forceAniso          = Config.Bind("GPU Quality",     "ForceAnisotropicFiltering", true, "Принудительно включить AF.");
             _globalMips          = Config.Bind("GPU Quality",     "GlobalTextureMipmapLimit", 0, "0 = макс. качество; 1..3 — грубее мипы.");
             _secondPass          = Config.Bind("GPU Streaming",   "EnableSecondPass", true, "Сделать повторный мягкий проход.");
-            _secondDelay         = Config.Bind("GPU Streaming",   "StreamingSecondPassDelaySec", 10, "Задержка перед повторным проходом, сек.");
-            _firstDelay          = Config.Bind("GPU Streaming",   "ForceLoadDelaySec", 2, "Задержка перед первым прогревом, сек.");
+            _secondDelay         = Config.Bind("GPU Streaming",   "StreamingSecondPassDelaySec", 12, "Задержка перед повторным проходом, сек.");
+            _firstDelay          = Config.Bind("GPU Streaming",   "ForceLoadDelaySec", 3, "Задержка перед первым прогревом, сек.");
             _uploadTuner         = Config.Bind("GPU Streaming",   "EnableUploadTuner", true, "Мягкие UploadMeshData-подсказки.");
 
             ApplyGraphicsOnce();
 
-            // Меню: безопасный мини‑проход (может обработать 0 — это ок)
-            StartCoroutine(InstancingPassDelayed(_firstDelay.Value, context:"menu", markFlag: ()=> _didMenuPass = true));
+            // Мини-проход в меню (может обработать 0 — это ок)
+            StartCoroutine(InstancingPassDelayed(_firstDelay.Value, context:"menu"));
 
             // Реагируем на смену сцен
             SceneManager.activeSceneChanged += OnSceneChanged;
@@ -55,11 +55,11 @@ namespace VPO
         {
             // Первый проход через пару секунд после входа в мир
             if (!_didWorldPass1)
-                StartCoroutine(InstancingPassDelayed(3, context:"world-1", markFlag: ()=> _didWorldPass1 = true));
+                StartCoroutine(InstancingPassDelayed(3, context:"world-1", markWorld1:true));
 
-            // Второй мягкий через 12–15 сек после входа (или что задано в конфиге)
+            // Второй мягкий через заданную задержку
             if (_secondPass.Value && !_didWorldPass2)
-                StartCoroutine(InstancingPassDelayed(Mathf.Max(8, _secondDelay.Value), context:"world-2", markFlag: ()=> _didWorldPass2 = true));
+                StartCoroutine(InstancingPassDelayed(Mathf.Max(8, _secondDelay.Value), context:"world-2", markWorld2:true));
         }
 
         private void ApplyGraphicsOnce()
@@ -70,7 +70,7 @@ namespace VPO
                 : AnisotropicFiltering.Enable;
         }
 
-        private IEnumerator InstancingPassDelayed(int delaySec, string context, System.Action markFlag)
+        private IEnumerator InstancingPassDelayed(int delaySec, string context, bool markWorld1 = false, bool markWorld2 = false)
         {
             if (!_enableInstancing.Value) yield break;
             if (delaySec > 0) yield return new WaitForSeconds(delaySec);
@@ -90,8 +90,9 @@ namespace VPO
             }
 
             Logger.LogInfo($"[GPU] Instancing включён ({context}), обработано материалов/рендереров: {processed}.");
-            markFlag?.Invoke();
-            yield break;
+
+            if (markWorld1) _didWorldPass1 = true;
+            if (markWorld2) _didWorldPass2 = true;
         }
 
         private int EnableInstancingFor(Renderer[] renderers)

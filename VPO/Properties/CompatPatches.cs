@@ -1,57 +1,43 @@
-// CompatPatches.cs — гибкие Harmony-патчи под Unity 6000: ловим CreateObject и FixedUpdate/UpdateAI без жёстких сигнатур.
 using System.Linq;
 using System.Reflection;
+using BepInEx.Logging;
 using HarmonyLib;
 using UnityEngine;
 
 namespace VPO
 {
-    // Универсальный хук ZNetScene.CreateObject(...).
-    // Включается флагом Core.HookCreateObject (по умолчанию false, чтобы не шуметь).
-    [HarmonyPatch]
-    internal static class ZNetScene_CreateObject_Patch
+    // Патчим без жёсткой сигнатуры: берём последнюю перегрузку CreateObject
+    internal static class CompatPatches
     {
-        static bool Prepare() => CoreMod.EnableCreateHook;
+        private static MethodInfo _target;
 
-        static MethodBase TargetMethod()
+        internal static void Patch_CreateObject(Harmony h, ManualLogSource log)
         {
-            var t = typeof(ZNetScene);
-            var m = AccessTools.GetDeclaredMethods(t)
-                                .Where(mi => mi.Name == "CreateObject")
-                                .OrderByDescending(mi => mi.GetParameters().Length)
-                                .FirstOrDefault();
-            if (m == null)
-                CoreMod.Log?.LogWarning("CreateObject: не найден — патч пропущен.");
-            else
-                CoreMod.Log?.LogInfo($"CreateObject: hooked => {m}");
-            return m;
+            var t = AccessTools.TypeByName("ZNetScene");
+            if (t == null) { log.LogWarning("ZNetScene не найден — пропускаю патч."); return; }
+
+            _target = AccessTools.GetDeclaredMethods(t)
+                                 .Where(m => m.Name == "CreateObject")
+                                 .OrderByDescending(m => m.GetParameters().Length)
+                                 .FirstOrDefault();
+
+            if (_target == null)
+            {
+                log.LogWarning("CreateObject: подходящих перегрузок не найдено — патч пропущен.");
+                return;
+            }
+
+            var pre = new HarmonyMethod(typeof(CompatPatches).GetMethod(nameof(CreateObject_Prefix),
+                                                                         BindingFlags.NonPublic | BindingFlags.Static));
+            h.Patch(_target, prefix: pre);
+            log.LogInfo($"[VPO Hook] Hooked: {t.FullName}.{_target.Name}({string.Join(", ", _target.GetParameters().Select(p => p.ParameterType.Name))})");
         }
 
-        // Сейчас просто пропускаем через оригинал. Когда захочешь — добавим пул/батч прямо здесь.
-        static bool Prefix() => true;
-    }
-
-    // Хук для BaseAI.* — находим FixedUpdate/UpdateAI/Update, где что есть в данной версии.
-    [HarmonyPatch]
-    internal static class BaseAI_Update_Patch
-    {
-        static MethodBase TargetMethod()
+        // Сейчас пропускаем через оригинал, но точка расширения есть:
+        private static bool CreateObject_Prefix()
         {
-            var t = typeof(BaseAI);
-            var m = AccessTools.Method(t, "FixedUpdate")
-                 ?? AccessTools.Method(t, "FixedUpdateAI")
-                 ?? AccessTools.Method(t, "UpdateAI")
-                 ?? AccessTools.Method(t, "Update");
-            if (m == null)
-                CoreMod.Log?.LogWarning("BaseAI: метод обновления не найден.");
-            else
-                CoreMod.Log?.LogInfo($"BaseAI: hooked => {m.Name}");
-            return m;
-        }
-
-        static bool Prefix()
-        {
-            return UpdateThrottler.ShouldRun(CoreMod.UpdateStep);
+            // здесь можно вставить пуллинг/батч и вернуть false, если нужно перехватить создание
+            return true; // true => выполнить оригинальный метод
         }
     }
 }

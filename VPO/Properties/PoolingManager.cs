@@ -1,4 +1,3 @@
-// PoolingManager.cs — простой кросс-сценовый пул GameObject.
 using System.Collections.Generic;
 using UnityEngine;
 
@@ -27,11 +26,14 @@ namespace VPO
         {
             if (!prefab) return null;
             var key = prefab.name;
+
             if (_pools.TryGetValue(key, out var q) && q.Count > 0)
             {
                 var obj = q.Dequeue();
-                if (obj) { obj.SetActive(true); return obj; }
+                if (obj) obj.SetActive(true);
+                return obj;
             }
+
             var inst = Object.Instantiate(prefab);
             inst.name = key;
             inst.SetActive(true);
@@ -42,11 +44,13 @@ namespace VPO
         {
             if (!obj) return;
             var key = obj.name;
+
             if (!_pools.TryGetValue(key, out var q))
             {
                 q = new Queue<GameObject>();
                 _pools[key] = q;
             }
+
             obj.SetActive(false);
             obj.transform.SetParent(Root, false);
             q.Enqueue(obj);
