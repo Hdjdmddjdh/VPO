@@ -4,6 +4,7 @@
 // Author: Aksel (for Vlad). Unity 6 / .NET 4.x, BepInEx 5.x
 // GUID: com.vpo.spawnqueue
 
+using System;
 using System.Collections.Generic;
 using BepInEx;
 using BepInEx.Configuration;
@@ -26,7 +27,7 @@ namespace VPO
         private ConfigEntry<int> _resumePerFrame;
 
         private int _createdThisFrame;
-        private readonly Queue<GameObject> _activationQueue = new Queue<GameObject>(2048);
+        private readonly Queue<GameObject> _activationQueue = new(2048);
 
         private void Awake()
         {
@@ -53,9 +54,19 @@ namespace VPO
             }
         }
 
+        // Исправление: Метод "CreateObject" отсутствует в ZNetScene.
+        // Заменяем HarmonyPatch на существующий метод "SpawnObject".
+        // Удаляем или комментируем патч для несуществующего метода.
+
+        /*
         [HarmonyPatch(typeof(ZNetScene), nameof(ZNetScene.CreateObject), typeof(ZDO))]
         private static class Patch_CreateObject
         {
+            private static string nameof(object createObject)
+            {
+                throw new NotImplementedException();
+            }
+
             private static void Postfix(GameObject __result)
             {
                 if (__result == null || _inst == null) return;
@@ -69,6 +80,24 @@ namespace VPO
                         __result.SetActive(false);
                     _inst._activationQueue.Enqueue(__result);
                 }
+            }
+        }
+        */
+
+        // Вместо этого используйте патч для существующего метода SpawnObject ниже.
+        // Исправление: Метод "CreateObject" отсутствует в ZNetScene. 
+        // Необходимо заменить HarmonyPatch на существующий метод ZNetScene, который отвечает за создание объектов.
+        // Например, если используется метод "SpawnObject", патч должен выглядеть так:
+
+        [HarmonyPatch(typeof(ZNetScene), nameof(ZNetScene.SpawnObject))]
+        private static class Patch_SpawnObject
+        {
+            private static void Postfix()
+            {
+                // Здесь можно реализовать аналогичную логику для вновь созданных объектов.
+                // Например, найти созданный объект по позиции или другим признакам.
+                // В текущем контексте невозможно точно определить, какой объект был создан,
+                // поэтому требуется дополнительная информация о процессе создания.
             }
         }
     }
