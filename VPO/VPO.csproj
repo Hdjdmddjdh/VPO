@@ -89,6 +89,7 @@
     <Compile Include="Properties\ThreadedWorldLoader.cs" />
     <Compile Include="Properties\UpdateThrottler.cs" />
     <Compile Include="Properties\VPO.AIThrottle.cs" />
+    <Compile Include="Properties\VPO.CullingLightFx.cs" />
     <Compile Include="Properties\VPO.SpawnQueue.cs" />
     <Compile Include="Properties\ZonePrefetch.cs" />
   </ItemGroup>

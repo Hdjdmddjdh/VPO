@@ -1,103 +1,179 @@
-
-// VPO.SpawnQueue.cs
-// BepInEx plugin: VPO Spawn Queue (defer GameObject activation to avoid spikes on base enter)
-// Author: Aksel (for Vlad). Unity 6 / .NET 4.x, BepInEx 5.x
-// GUID: com.vpo.spawnqueue
-
 using System;
 using System.Collections.Generic;
 using BepInEx;
-using BepInEx.Configuration;
+using BepInEx.Logging;
 using HarmonyLib;
 using UnityEngine;
+using BepInEx.Configuration;
 
 namespace VPO
 {
-    [BepInPlugin(GUID, NAME, VERSION)]
+    [BepInPlugin("com.example.vpo.spawnqueue", "VPO Spawn Queue", "0.2.0")]
     public class VpoSpawnQueue : BaseUnityPlugin
     {
-        public const string GUID = "com.vpo.spawnqueue";
-        public const string NAME = "VPO Spawn Queue";
-        public const string VERSION = "0.2.0";
+        internal static VpoSpawnQueue Instance;
+        internal static ManualLogSource Log;
 
-        private static VpoSpawnQueue _inst;
+        // Очередь отложенной активации
+        private readonly Queue<GameObject> _activationQueue = new Queue<GameObject>();
 
+        // Сколько объектов создали в этом кадре
+        private int _createdThisFrame;
+
+        // Конфиги
+        private ConfigEntry<bool> _enabled;
         private ConfigEntry<bool> _deferExtra;
         private ConfigEntry<int> _maxNewPerFrame;
-        private ConfigEntry<int> _resumePerFrame;
+        private ConfigEntry<int> _maxActivationsPerFrame;
 
-        private int _createdThisFrame;
-        private readonly Queue<GameObject> _activationQueue = new(2048);
+        private Harmony _harmony;
 
         private void Awake()
         {
-            _inst = this;
-            _deferExtra     = Config.Bind("Queue", "DeferExtra", true, "Если за кадр создано слишком много объектов — временно деактивировать лишние и активировать позже.");
-            _maxNewPerFrame = Config.Bind("Queue", "MaxNewPerFrame", 50, "Сколько новых объектов можно активировать сразу в кадре (остальные в очередь).");
-            _resumePerFrame = Config.Bind("Queue", "ResumePerFrame", 80, "Сколько «отложенных» объектов активировать каждый кадр.");
+            Instance = this;
+            Log = Logger;
 
-            Harmony.CreateAndPatchAll(typeof(VpoSpawnQueue));
-            Logger.LogInfo($"{NAME} {VERSION} initialized.");
-        }
+            // === Конфиг ===
+            _enabled = Config.Bind(
+                "General",
+                "Enabled",
+                true,
+                "Включить очередь спавна объектов."
+            );
 
-        private void Update()
-        {
-            // Сбрасываем счётчик на каждый кадр
-            _createdThisFrame = 0;
+            _deferExtra = Config.Bind(
+                "General",
+                "DeferExtra",
+                true,
+                "Если включено, объекты сверх лимита за кадр будут временно выключены и активированы позже."
+            );
 
-            // Активируем отложенные объекты порциями
-            int toResume = _resumePerFrame.Value;
-            while (toResume-- > 0 && _activationQueue.Count > 0)
+            _maxNewPerFrame = Config.Bind(
+                "General",
+                "MaxNewPerFrame",
+                120,
+                "Максимальное количество новых объектов, создаваемых за один кадр до начала откладывания в очередь."
+            );
+
+            _maxActivationsPerFrame = Config.Bind(
+                "General",
+                "MaxActivationsPerFrame",
+                30,
+                "Максимальное количество отложенных объектов, активируемых за один кадр."
+            );
+
+            // === Harmony-патчи ===
+            _harmony = new Harmony("com.example.vpo.spawnqueue");
+
+            try
             {
-                var go = _activationQueue.Dequeue();
-                if (go) go.SetActive(true);
+                _harmony.PatchAll(typeof(VpoSpawnQueue).Assembly);
+                Log.LogInfo("[VPO SpawnQueue] Патчи применены.");
+            }
+            catch (Exception e)
+            {
+                Log.LogError($"[VPO SpawnQueue] Ошибка при PatchAll: {e.GetType().Name}: {e.Message}");
             }
         }
 
-        // Исправление: Метод "CreateObject" отсутствует в ZNetScene.
-        // Заменяем HarmonyPatch на существующий метод "SpawnObject".
-        // Удаляем или комментируем патч для несуществующего метода.
-
-        /*
-        [HarmonyPatch(typeof(ZNetScene), nameof(ZNetScene.CreateObject), typeof(ZDO))]
-        private static class Patch_CreateObject
+        private void OnDestroy()
         {
-            private static string nameof(object createObject)
+            if (_harmony != null)
             {
-                throw new NotImplementedException();
-            }
-
-            private static void Postfix(GameObject __result)
-            {
-                if (__result == null || _inst == null) return;
-
-                _inst._createdThisFrame++;
-
-                if (_inst._deferExtra.Value && _inst._createdThisFrame > _inst._maxNewPerFrame.Value)
+                try
                 {
-                    // Временно «замораживаем» активацию тяжёлых объектов
-                    if (__result.activeSelf)
-                        __result.SetActive(false);
-                    _inst._activationQueue.Enqueue(__result);
+                    _harmony.UnpatchSelf();
+                    Log.LogInfo("[VPO SpawnQueue] Патчи сняты.");
+                }
+                catch (Exception e)
+                {
+                    Log.LogError($"[VPO SpawnQueue] Ошибка при UnpatchSelf: {e.GetType().Name}: {e.Message}");
                 }
             }
         }
-        */
 
-        // Вместо этого используйте патч для существующего метода SpawnObject ниже.
-        // Исправление: Метод "CreateObject" отсутствует в ZNetScene. 
-        // Необходимо заменить HarmonyPatch на существующий метод ZNetScene, который отвечает за создание объектов.
-        // Например, если используется метод "SpawnObject", патч должен выглядеть так:
-
-        [HarmonyPatch(typeof(ZNetScene), nameof(ZNetScene.SpawnObject))]
-        private static class Patch_SpawnObject
+        private void LateUpdate()
         {
-            private static void Postfix()
+            // Каждый кадр обнуляем счётчик созданных объектов
+            _createdThisFrame = 0;
+
+            if (!_enabled.Value)
+                return;
+
+            if (_activationQueue.Count == 0)
+                return;
+
+            int remaining = Mathf.Max(0, _maxActivationsPerFrame.Value);
+
+            while (remaining-- > 0 && _activationQueue.Count > 0)
             {
-                // Здесь можно реализовать аналогичную логику для вновь созданных объектов.
-                // Например, найти созданный объект по позиции или другим признакам.
-                // В текущем контексте невозможно точно определить, какой объект был создан,
-                // поэтому требуется дополнительная информация о процессе создания.
+                var go = _activationQueue.Dequeue();
+
+                if (!go)
+                    continue;
+
+                if (!go.activeSelf)
+                {
+                    try
+                    {
+                        go.SetActive(true);
+                    }
+                    catch (Exception e)
+                    {
+                        Log.LogWarning($"[VPO SpawnQueue] Ошибка при активации объекта '{go.name}': {e.GetType().Name}: {e.Message}");
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Внутренний вызов из патча: зарегистрировать только что созданный объект.
+        /// </summary>
+        internal void OnObjectCreated(GameObject go)
+        {
+            if (!_enabled.Value || go == null)
+                return;
+
+            _createdThisFrame++;
+
+            // Если откладывание выключено – даём игре работать как обычно
+            if (!_deferExtra.Value)
+                return;
+
+            // Пока не превысили лимит – тоже ничего не трогаем
+            if (_createdThisFrame <= _maxNewPerFrame.Value)
+                return;
+
+            // Всё сверх лимита – в очередь
+            try
+            {
+                if (go.activeSelf)
+                    go.SetActive(false);
+
+                _activationQueue.Enqueue(go);
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning($"[VPO SpawnQueue] Ошибка при добавлении объекта '{go.name}' в очередь: {e.GetType().Name}: {e.Message}");
+            }
+        }
+
+        // ============================
+        // Harmony-патч на ZNetScene.CreateObject(ZDO)
+        // ============================
+
+        [HarmonyPatch(typeof(ZNetScene), "CreateObject")]
+        [HarmonyPatch(new Type[] { typeof(ZDO) })]
+        private static class Patch_ZNetScene_CreateObject
+        {
+            // Postfix, чтобы поймать уже созданный объект
+            private static void Postfix(GameObject __result)
+            {
+                var inst = VpoSpawnQueue.Instance;
+                if (inst == null || __result == null)
+                    return;
+
+                inst.OnObjectCreated(__result);
             }
         }
     }
