@@ -12,14 +12,15 @@ namespace VPO.Modules
 
         private static IEnumerator DoWarmup(float delaySec)
         {
-            if (delaySec > 0f) yield return new WaitForSecondsRealtime(delaySec);
+            if (delaySec > 0f)
+                yield return new WaitForSecondsRealtime(delaySec);
 
-            float end = Time.unscaledTime + 3f;
-            while (Time.unscaledTime < end)
-            {
-                Resources.UnloadUnusedAssets();
-                yield return null;
-            }
+            // ќдин т€жЄлый проход
+            Resources.UnloadUnusedAssets();
+
+            // ≈щЄ один Ц через секунду, чтобы добить мусор, но без лупа по 3 секунды
+            yield return new WaitForSecondsRealtime(1f);
+            Resources.UnloadUnusedAssets();
         }
     }
 }
