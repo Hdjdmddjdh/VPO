@@ -1,60 +1,23 @@
-using System;
-using HarmonyLib;
-using UnityEngine;
-
-namespace VPO.Modules
+namespace VPO
 {
-    /// <summary>
-    /// Распределяет апдейты ИИ/физики по кадрам.
-    /// Простая логика: выполняем только раз в N кадров (N динамический).
-    /// </summary>
-    public static class UpdateThrottler
+    internal static class UpdateThrottler
     {
-        private static int _aiInterval = 2;
-        private static int _physicsInterval = 2;
+        private static int _frameCounter;
 
-        public static void Configure(int aiInterval, int physicsInterval)
+        /// <summary>
+        /// Возвращает true, если в этом кадре логику можно выполнять.
+        /// step <= 1 — всегда true.
+        /// </summary>
+        internal static bool ShouldRun(int step)
         {
-            _aiInterval = Mathf.Max(1, aiInterval);
-            _physicsInterval = Mathf.Max(1, physicsInterval);
-        }
+            if (step <= 1)
+                return true;
 
-        private static bool ShouldRun(int interval)
-        {
-            if (interval <= 1) return true;
-            return (Time.frameCount % interval) == 0;
-        }
+            if (step < 0)
+                step = 1;
 
-        // ---- Патч BaseAI.UpdateAI ----
-        [HarmonyPatch]
-        internal static class Patch_BaseAI_UpdateAI
-        {
-            static System.Reflection.MethodBase TargetMethod()
-            {
-                var t = AccessTools.TypeByName("BaseAI");
-                return t != null ? AccessTools.Method(t, "UpdateAI") : null;
-            }
-
-            static bool Prefix()
-            {
-                return ShouldRun(_aiInterval);
-            }
-        }
-
-        // ---- Патч BaseAI.FixedUpdate ----
-        [HarmonyPatch]
-        internal static class Patch_BaseAI_FixedUpdate
-        {
-            static System.Reflection.MethodBase TargetMethod()
-            {
-                var t = AccessTools.TypeByName("BaseAI");
-                return t != null ? AccessTools.Method(t, "FixedUpdate") : null;
-            }
-
-            static bool Prefix()
-            {
-                return ShouldRun(_physicsInterval);
-            }
+            _frameCounter++;
+            return (_frameCounter % step) == 0;
         }
     }
 }
